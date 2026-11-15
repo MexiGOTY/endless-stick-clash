@@ -1,0 +1,920 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Endless Stick Clash</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* Endless Stick Clash — procedural, never-repeating stick figure fight.
+   White fighter: rubber / toon powers. Yellow fighter: time-slowing speed implant.
+   Set Lively's display layout to "Span" so the fight roams across every monitor. */
+
+const cv = document.getElementById('c'), ctx = cv.getContext('2d', { alpha: false });
+const PI = Math.PI, TAU = PI * 2, sin = Math.sin, cos = Math.cos, abs = Math.abs, max = Math.max, min = Math.min;
+const rnd = Math.random, rr = (a, b) => a + rnd() * (b - a), pick = a => a[(rnd() * a.length) | 0];
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v, lerp = (a, b, t) => a + (b - a) * t, sgn = v => v < 0 ? -1 : 1;
+const hs = n => { const v = sin(n * 127.1) * 43758.5453; return v - Math.floor(v); };
+const E = {
+  lin: t => t, out: t => 1 - (1 - t) ** 3, in: t => t * t * t,
+  io: t => t < .5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2,
+  back: t => { const c = 1.70158; return 1 + (c + 1) * (t - 1) ** 3 + c * (t - 1) ** 2; },
+  elastic: t => t <= 0 ? 0 : t >= 1 ? 1 : 2 ** (-10 * t) * sin((t * 10 - .75) * TAU / 3) + 1
+};
+
+const GC = '#ffffff', SC = '#ffd21f', TEAL = '#3fffd2';
+const HUES = [165, 185, 205, 265, 300, 330, 45];
+const QS = new URLSearchParams(location.search);
+let FORCE = QS.get('seq'), SPEED = +QS.get('speed') || 1;
+
+let W = 0, H = 0, U = 20, GY = 0, EDGE = 0, MONS = 1, MELEE = 0;
+let time = 0, sdt = 0, wts = 1, sand = false, sandA = 0, freeze = 0, shake = 0;
+let fx = [], ghosts = [], bullets = [], marks = [], procs = [], gwave = null, jav = null, ghostN = 0;
+let seqStart = 0, curSeq = '', lastErr = null;
+const tweens = [];
+
+/* ---------- tweens & coroutines ---------- */
+function tw(o, props, dur, ease, own) {
+  for (const k in props) {
+    for (let i = tweens.length - 1; i >= 0; i--) if (tweens[i].o === o && tweens[i].k === k) tweens.splice(i, 1);
+    if (!(dur > 0)) { o[k] = props[k]; continue; }
+    tweens.push({ o, k, a: o[k], b: props[k], t: 0, d: dur, e: E[ease] || E.out, own: own || o });
+  }
+  return dur > 0 ? dur : 0;
+}
+function stepTweens(d) {
+  for (let i = tweens.length - 1; i >= 0; i--) {
+    const w = tweens[i], ts = w.own.ts !== undefined ? w.own.ts : wts;
+    w.t += d * ts / w.d;
+    if (w.t >= 1) { w.o[w.k] = w.b; tweens.splice(i, 1); } else w.o[w.k] = w.a + (w.b - w.a) * w.e(w.t);
+  }
+}
+function spawn(g) { const p = { g, w: 0, dead: false }; procs.push(p); return p; }
+function after(t, fn) { spawn((function* () { yield t; fn(); })()); }
+function stepProcs(d) {
+  for (let i = 0; i < procs.length; i++) {
+    const p = procs[i]; if (p.dead) continue;
+    p.w -= d; let guard = 0;
+    while (p.w <= 0 && !p.dead) {
+      const r = p.g.next();
+      if (r.done) { p.dead = true; break; }
+      const v = +r.value || 0;
+      if (v <= 0) { p.w = 0; break; }
+      p.w += v; if (++guard > 60) break;
+    }
+  }
+  procs = procs.filter(p => !p.dead);
+}
+function* until(f, mx = 5) { const t0 = time; while (!f() && time - t0 < mx) yield 0; }
+
+/* ---------- poses ---------- */
+// angles: limbs measured from straight down, + = forward. torso from straight up, + = lean forward.
+// a = front arm, b = back arm, l = front leg, r = back leg (upper, lower). h = head tilt.
+function ps(t, a1, a2, b1, b2, l1, l2, r1, r2, h = 0) { return { t, a1, a2, b1, b2, l1, l2, r1, r2, h }; }
+const PK = ['t', 'a1', 'a2', 'b1', 'b2', 'l1', 'l2', 'r1', 'r2', 'h'];
+const POSES = {
+  guard: ps(.18, .95, 2.3, .4, 2.0, .5, .05, -.35, -.75),
+  stand: ps(0, .1, .25, -.1, .05, .1, .02, -.1, -.14),
+  jab: ps(.3, 1.55, 1.6, .2, 2.1, .7, .1, -.55, -.8),
+  cross: ps(.45, .3, 2.0, 1.5, 1.55, .85, .15, -.7, -.95),
+  hook: ps(.25, 1.7, 2.5, .3, 2.0, .6, .1, -.5, -.8),
+  upper: ps(-.15, 2.5, 3.0, -.5, .6, .35, 0, -.3, -.5, -.2),
+  wind: ps(-.1, -.9, .9, .9, 2.1, .3, -.1, -.5, -.9),
+  crouch: ps(.55, .6, 1.6, .2, 1.4, 1.1, -.5, -.2, -1.5),
+  chamber: ps(-.1, .8, 2.2, .3, 2.0, 1.5, .2, -.1, -.2),
+  kick: ps(-.3, .2, 1.2, -.6, .4, 1.45, 1.5, -.15, -.3),
+  high: ps(-.5, .3, 1.0, -.8, .2, 2.2, 2.2, -.1, -.2),
+  sweep: ps(.7, .9, 1.2, .4, .3, 1.35, 1.45, -.5, -1.7),
+  knee: ps(.2, .9, 2.4, .5, 2.2, 1.7, .3, -.4, -.6),
+  block: ps(.05, 1.2, 2.9, 1.0, 2.8, .4, 0, -.4, -.7),
+  duck: ps(.9, .8, 2.0, .5, 1.8, 1.2, -.4, -.3, -1.5),
+  lean: ps(-.7, .4, .9, -.2, .3, .5, .3, -.2, -.5, -.2),
+  tuck: ps(.4, .8, 1.8, .6, 1.6, 1.6, .1, 1.3, -.2),
+  hurt: ps(-.55, 1.3, 1.0, .9, .5, .5, .3, -.1, -.5, -.4),
+  hurtUp: ps(-.8, 2.2, 2.5, 2.0, 2.2, .3, .4, .1, -.1, -.5),
+  trip: ps(-1.2, 2, 2.2, 1.7, 2, 1.5, 1.3, 1.2, .9),
+  fly: ps(-.4, 2.3, 2.6, -1, -.6, .9, .4, -.6, -1.1, -.3),
+  land: ps(.7, .5, .2, -.5, .2, 1.2, -.6, -.6, -1.6),
+  air: ps(.3, -.5, .3, 2.4, 2.7, .9, .95, -.6, -1.4),
+  gun: ps(.05, 1.57, 1.57, .2, .5, .25, .05, -.25, -.45),
+  armsUp: ps(-.1, 2.6, 2.9, -2.6, -2.9, .3, .1, -.3, -.4, -.2),
+  reachUp: ps(-.1, 2.9, 3.05, -.4, .2, .2, 0, -.2, -.3, -.3),
+  grab: ps(1.2, .5, .3, .3, .1, 1.2, -.5, -.3, -1.5),
+  pant: ps(.8, .3, 0, .2, -.1, 1.4, -.1, .2, -1.5, .4),
+  dash: ps(1.0, -.9, -.6, -1.1, -.9, 1.3, .3, -.9, -1.4),
+  pull: ps(.3, -1.5, -1.5, -1.4, -1.5, .6, .1, -.5, -.8),
+  palms: ps(.5, 1.5, 1.55, 1.6, 1.6, .9, .15, -.7, -.95),
+  stomp: ps(.2, 2.4, 2.7, -2.4, -2.7, .15, .1, .1, 0)
+};
+function runPose(ph, lean) {
+  const s = sin(ph), c = cos(ph);
+  return {
+    t: lean, h: -lean * .4,
+    l1: s, l2: s - .25 - .9 * max(0, c), r1: -s, r2: -s - .25 - .9 * max(0, -c),
+    a1: -s * .9, a2: -s * .9 + 1.2, b1: s * .9, b2: s * .9 + 1.2
+  };
+}
+function laughPose(a) {
+  const s = sin(a.ph);
+  return { t: -.5 + .12 * s, h: -.3, a1: .7, a2: 2.0 + .25 * s, b1: .5, b2: 1.9 + .25 * s, l1: .35, l2: .2, r1: -.3, r2: -.45 };
+}
+
+/* ---------- fighters ---------- */
+class Actor {
+  constructor(col, rubber) { this.col = col; this.rubber = rubber; this.reset(0); }
+  reset(x) {
+    Object.assign(this, {
+      x, y: GY, vx: 0, vy: 0, dir: 1, rot: 0, spin: 0, sc: 1, sx: 1, sy: 1, ts: 1, phys: false, bounces: 0,
+      cycle: null, ph: 0, lean: this.rubber ? .35 : .45, p: { ...POSES.guard }, pa: { ...POSES.guard }, pb: POSES.guard, pt: 1, pd: .1, pe: E.back,
+      neck: 0, balloon: 0, bulge: 0, wob: 0, ghost: false, gt: 0, glitch: 0, gun: 0, gat: 0, gatT: 0, wheel: 0, hold: 0,
+      lx: x, ly: GY, gx: -9999, gy: 0,
+      rf: { k: 0, t: null, fist: 0 }, rb: { k: 0, t: null, fist: 0 }, lf: { k: 0, t: null, fist: 0 }, lb: { k: 0, t: null, fist: 0 }
+    });
+  }
+  pose(n, d = .12, e = 'back') {
+    this.cycle = null; this.pa = { ...this.p };
+    this.pb = typeof n === 'string' ? (POSES[n] || POSES.guard) : n;
+    this.pt = 0; this.pd = max(d, .001); this.pe = E[e] || E.back; return d;
+  }
+  to(props, d, e) { return tw(this, props, d, e, this); }
+  launch(vx, vy, o = {}) {
+    this.cycle = null; this.wheel = 0; tw(this, { x: this.x, y: this.y, rot: this.rot }, 0);
+    this.phys = true; this.vx = vx; this.vy = vy;
+    this.spin = o.spin !== undefined ? o.spin : sgn(vx) * rr(8, 13);
+    this.bounces = o.bounces !== undefined ? o.bounces : 1;
+    this.pose('fly', .08);
+  }
+  squash(a, b) { if (!this.rubber) return; this.sy = a; this.sx = b; this.to({ sx: 1, sy: 1 }, .5, 'elastic'); }
+  land() {
+    this.phys = false; this.y = GY;
+    let r = this.rot % TAU; if (r > PI) r -= TAU; if (r < -PI) r += TAU; this.rot = r;
+    this.to({ rot: 0 }, .14); this.pose('land', .08);
+    this.to({ x: cx(this.x + this.vx * .1) }, .35, 'out');
+    dust(this.x, 8, sgn(this.vx)); this.squash(.45, 1.5); this.vx = this.vy = 0;
+  }
+  update(d) {
+    const t = d * this.ts;
+    if (this.phys) {
+      this.vy += U * 120 * t; this.x += this.vx * t; this.y += this.vy * t; this.rot += this.spin * t;
+      if ((this.x < EDGE * .6 && this.vx < 0) || (this.x > W - EDGE * .6 && this.vx > 0)) {
+        const wx = this.vx < 0 ? 0 : W; this.x = clamp(this.x, EDGE * .6, W - EDGE * .6);
+        wallHit(wx, this.y - 4 * U); this.vx *= -.55; this.spin *= -1; this.squash(1.5, .45);
+      }
+      if (this.y < 9 * U && this.vy < 0) { this.y = 9 * U; this.vy *= -.4; clash(this.x, 2 * U); }
+      if (this.y >= GY && this.vy > 0) {
+        this.y = GY;
+        if (this.bounces > 0 && this.vy > U * 35) {
+          this.bounces--; this.vy *= -.45; this.vx *= .75; dust(this.x, 6, sgn(this.vx)); shake = min(40, shake + 4);
+          ring(this.x, GY, 4 * U, '#fff', .2, 2); this.squash(.5, 1.45);
+        } else this.land();
+      }
+    }
+    if (this.cycle) {
+      const mv = Math.hypot(this.x - this.lx, this.y - this.ly);
+      this.ph += this.cycle === 'laugh' ? t * 16 : min(mv / (U * 1.5), t * 22);
+      const tp = this.cycle === 'laugh' ? laughPose(this) : runPose(this.ph, this.lean), f = 1 - Math.exp(-t * 28);
+      for (const k of PK) this.p[k] += (tp[k] - this.p[k]) * f;
+    } else if (this.pt < 1) {
+      this.pt = min(1, this.pt + t / this.pd); const e = this.pe(this.pt);
+      for (const k of PK) this.p[k] = this.pa[k] + (this.pb[k] - this.pa[k]) * e;
+    }
+    this.lx = this.x; this.ly = this.y; this.wob *= Math.exp(-t * 4.5); this.gatT += t;
+    if (this.ghost) {
+      this.gt -= d;
+      if (this.gt <= 0 && Math.hypot(this.x - this.gx, this.y - this.gy) > U * .9) {
+        this.gt = .026; this.gx = this.x; this.gy = this.y;
+        ghosts.push({ J: this.joints(), hue: HUES[(ghostN++) % HUES.length], t: 0 });
+        if (ghosts.length > 70) ghosts.shift();
+      }
+    }
+  }
+  joints() {
+    const p = this.p, d = this.dir, TH = 2.15, SH = 2.15, T = 3.3, UA = 1.8, FA = 1.8, HR = 1.25;
+    const hy = -max(TH * cos(p.l1) + SH * cos(p.l2), TH * cos(p.r1) + SH * cos(p.r2), 1.3);
+    const k1 = [TH * sin(p.l1) * d, hy + TH * cos(p.l1)], f1 = [k1[0] + SH * sin(p.l2) * d, k1[1] + SH * cos(p.l2)];
+    const k2 = [TH * sin(p.r1) * d, hy + TH * cos(p.r1)], f2 = [k2[0] + SH * sin(p.r2) * d, k2[1] + SH * cos(p.r2)];
+    const nk = [T * sin(p.t) * d, hy - T * cos(p.t)];
+    const ha = p.t + p.h, hl = HR + this.neck, hd = [nk[0] + hl * sin(ha) * d, nk[1] - hl * cos(ha)];
+    const e1 = [nk[0] + UA * sin(p.a1) * d, nk[1] + UA * cos(p.a1)], h1 = [e1[0] + FA * sin(p.a2) * d, e1[1] + FA * cos(p.a2)];
+    const e2 = [nk[0] + UA * sin(p.b1) * d, nk[1] + UA * cos(p.b1)], h2 = [e2[0] + FA * sin(p.b2) * d, e2[1] + FA * cos(p.b2)];
+    const sX = this.sx * this.sc * U, sY = this.sy * this.sc * U, rot = this.rot, cr = cos(rot), sr = sin(rot);
+    const py = (hy - .8) * sY, wob = this.wob, ox = this.x, oy = this.y;
+    const M = q => {
+      let x = q[0] * sX, y = q[1] * sY;
+      if (wob > .01) x += sin(time * 45 + q[1] * 1.7) * wob * U * .7;
+      if (rot) { const yy = y - py, xr = x * cr - yy * sr; y = x * sr + yy * cr + py; x = xr; }
+      return [ox + x, oy + y];
+    };
+    const J = { hip: M([0, hy]), k1: M(k1), f1: M(f1), k2: M(k2), f2: M(f2), nk: M(nk), hd: M(hd), e1: M(e1), h1: M(h1), e2: M(e2), h2: M(h2) };
+    const R = (r, key) => {
+      if (r.k > .01 && r.t) {
+        const tp = typeof r.t === 'function' ? r.t() : r.t;
+        J[key] = [lerp(J[key][0], tp.x, r.k), lerp(J[key][1], tp.y, r.k)]; return 1;
+      } return 0;
+    };
+    J.st = [R(this.rf, 'h1'), R(this.rb, 'h2'), R(this.lf, 'f1'), R(this.lb, 'f2')];
+    J.fist = [this.rf.fist, this.rb.fist, this.lf.fist, this.lb.fist];
+    J.s = this.sc * U; J.hr = HR * J.s * (abs(this.sx) + this.sy) / 2; J.lw = max(1.5, .62 * J.s);
+    J.bal = this.balloon; J.bulge = this.bulge; J.d = d; J.wheel = this.wheel; J.wph = this.ph; J.gun = this.gun; J.neck = this.neck;
+    return J;
+  }
+}
+const G = new Actor(GC, true), S = new Actor(SC, false);
+const other = a => a === G ? S : G;
+const P = (a, n, d, e) => a.pose(n, d, e);
+const chest = a => ({ x: a.x, y: a.y - 5.2 * U * a.sc });
+const cx = x => clamp(x, EDGE, W - EDGE);
+const zone = x => clamp(Math.floor(x / (W / MONS)), 0, MONS - 1), zoneX = i => (i + .5) * W / MONS;
+function face(a, b) { if (b.x !== a.x) a.dir = b.x > a.x ? 1 : -1; }
+function faceBoth() { face(G, S); face(S, G); }
+function nudge(a, d, dur, e) { return a.to({ x: cx(a.x + a.dir * d) }, dur, e); }
+
+/* ---------- drawing ---------- */
+function limb(a, b, c, st) {
+  ctx.moveTo(a[0], a[1]);
+  if (st) {
+    const mx = (a[0] + c[0]) / 2, my = (a[1] + c[1]) / 2, dx = c[0] - a[0], dy = c[1] - a[1], w = sin(time * 20 + a[0] * .01) * .07;
+    ctx.quadraticCurveTo(mx - dy * w, my + dx * w, c[0], c[1]);
+  } else { ctx.lineTo(b[0], b[1]); ctx.lineTo(c[0], c[1]); }
+}
+function drawFig(J, col, alpha, ghost) {
+  ctx.globalAlpha = alpha; ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = J.lw; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.beginPath();
+  if (J.wheel) {
+    const c = [J.hip[0], J.hip[1] + 2.1 * J.s], r = 2.0 * J.s;
+    ctx.moveTo(J.hip[0], J.hip[1]); ctx.lineTo(c[0], c[1]);
+    for (let i = 0; i < 4; i++) {
+      const a = J.wph * 1.6 * J.d + i * TAU / 4;
+      ctx.moveTo(c[0], c[1]); ctx.lineTo(c[0] + cos(a) * r, c[1] + sin(a) * r);
+      ctx.moveTo(c[0] + cos(a) * r, c[1] + sin(a) * r); ctx.arc(c[0], c[1], r, a, a + .9 * J.d, J.d < 0);
+    }
+  } else { limb(J.hip, J.k1, J.f1, J.st[2]); limb(J.hip, J.k2, J.f2, J.st[3]); }
+  ctx.moveTo(J.hip[0], J.hip[1]);
+  if (J.bulge > .01 || J.bulge < -.01) ctx.quadraticCurveTo((J.hip[0] + J.nk[0]) / 2 - J.d * J.bulge * 3.5 * J.s, (J.hip[1] + J.nk[1]) / 2, J.nk[0], J.nk[1]);
+  else ctx.lineTo(J.nk[0], J.nk[1]);
+  limb(J.nk, J.e1, J.h1, J.st[0]); limb(J.nk, J.e2, J.h2, J.st[1]);
+  if (J.neck > .1) { ctx.moveTo(J.nk[0], J.nk[1]); ctx.lineTo(J.hd[0], J.hd[1]); }
+  ctx.stroke();
+  const pts = [J.h1, J.h2, J.f1, J.f2];
+  for (let i = 0; i < 4; i++) if (J.fist[i] > .05) { ctx.beginPath(); ctx.arc(pts[i][0], pts[i][1], J.fist[i] * J.s * .9, 0, TAU); ctx.fill(); }
+  if (J.bal > .02) {
+    ctx.beginPath(); ctx.arc((J.hip[0] + J.nk[0]) / 2, (J.hip[1] + J.nk[1]) / 2, J.bal * 3.4 * J.s, 0, TAU);
+    if (!ghost) { ctx.fillStyle = '#000'; ctx.fill(); } ctx.stroke();
+  }
+  ctx.beginPath(); ctx.arc(J.hd[0], J.hd[1], J.hr, 0, TAU);
+  if (!ghost) { ctx.fillStyle = '#000'; ctx.fill(); } ctx.stroke();
+  if (J.gun) {
+    ctx.strokeStyle = '#c9c9c9'; ctx.lineWidth = J.lw * .8; ctx.beginPath();
+    ctx.moveTo(J.h1[0], J.h1[1] + .7 * J.s); ctx.lineTo(J.h1[0], J.h1[1] - .2 * J.s); ctx.lineTo(J.h1[0] + J.d * 1.5 * J.s, J.h1[1] - .2 * J.s); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+function drawToon(J) { // flame hair + steam halo for the rubber fighter
+  const ux = J.hd[0] - J.nk[0], uy = J.hd[1] - J.nk[1], base = Math.atan2(uy, ux), s = J.s, r = J.hr;
+  ctx.fillStyle = GC;
+  for (let i = -2; i <= 2; i++) {
+    const a = base + i * .42, len = r * (1.0 + .45 * sin(time * 7 + i * 1.9) + (i === 0 ? .35 : 0));
+    const ta = a + sin(time * 5 + i) * .22 - J.d * .25;
+    ctx.beginPath();
+    ctx.moveTo(J.hd[0] + cos(a - .24) * r, J.hd[1] + sin(a - .24) * r);
+    ctx.quadraticCurveTo(J.hd[0] + cos(a - .1) * (r + len * .6), J.hd[1] + sin(a - .1) * (r + len * .6), J.hd[0] + cos(ta) * (r + len), J.hd[1] + sin(ta) * (r + len));
+    ctx.quadraticCurveTo(J.hd[0] + cos(a + .16) * (r + len * .5), J.hd[1] + sin(a + .16) * (r + len * .5), J.hd[0] + cos(a + .24) * r, J.hd[1] + sin(a + .24) * r);
+    ctx.fill();
+  }
+  ctx.globalAlpha = .82;
+  for (let i = -5; i <= 5; i++) {
+    if (abs(i) < 2) continue; // leave the top open so the flame hair reads
+    const a = base + i * .42, rad = 3.35 * s + sin(time * 3 + i) * .18 * s;
+    ctx.beginPath(); ctx.arc(J.nk[0] + cos(a) * rad - J.d * .5 * s, J.nk[1] + sin(a) * rad, (i % 2 ? .5 : .68) * s, 0, TAU); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function drawBolt(x1, y1, x2, y2, w) {
+  const dx = x2 - x1, dy = y2 - y1, L = Math.hypot(dx, dy) || 1, n = max(3, L / (1.6 * U) | 0), nx = -dy / L, ny = dx / L;
+  ctx.beginPath(); ctx.moveTo(x1, y1);
+  for (let i = 1; i < n; i++) { const u = i / n, o = rr(-1, 1) * 1.1 * U; ctx.lineTo(x1 + dx * u + nx * o, y1 + dy * u + ny * o); }
+  ctx.lineTo(x2, y2); ctx.lineJoin = 'miter';
+  ctx.strokeStyle = '#8fd0ff'; ctx.globalAlpha = .35; ctx.lineWidth = w * 3.2; ctx.stroke();
+  ctx.globalAlpha = 1; ctx.strokeStyle = '#fff'; ctx.lineWidth = w; ctx.stroke(); ctx.lineJoin = 'round';
+}
+
+/* ---------- effects ---------- */
+function addFx(o) { o.t = 0; fx.push(o); if (fx.length > 900) fx.shift(); return o; }
+function ring(x, y, r, col, life = .3, lw = 4, rt) { addFx({ k: 'ring', x, y, r, col, life, lw, rt }); }
+function burst(x, y, n, len, col) { const L = []; for (let i = 0; i < n; i++) L.push([rnd() * TAU, rr(.5, 1)]); addFx({ k: 'burst', x, y, L, len, col, life: .22 }); }
+function sparks(x, y, n, spd, col) { for (let i = 0; i < n; i++) { const a = rnd() * TAU, s = rr(.3, 1) * spd; addFx({ k: 'spark', x, y, vx: cos(a) * s, vy: sin(a) * s - spd * .3, col, life: rr(.25, .6) }); } }
+function flash(x, y, r, col, rt) { addFx({ k: 'flash', x, y, r, col, life: .12, rt }); }
+function dust(x, n, dir = 0) { for (let i = 0; i < n; i++) addFx({ k: 'puff', x: x + rr(-1, 1) * U, y: GY - rr(0, .6) * U, vx: (dir * rr(.3, 1) + rr(-.4, .4)) * U * 14, vy: -rr(.5, 3) * U, r: rr(.5, 1.2) * U, life: rr(.35, .7) }); }
+function slash(x1, y1, x2, y2, col, lw = 5, life = .22, rt) { addFx({ k: 'slash', x1, y1, x2, y2, col, lw, life, rt }); }
+function swoosh(x, y, r, dir, col) { addFx({ k: 'swoosh', x, y, r, a0: dir > 0 ? -1.1 : PI - 1.1, a1: dir > 0 ? 1.1 : PI + 1.1, col, life: .16 }); }
+function impact(x, y, pow, col) {
+  ring(x, y, (5 + pow * 5) * U, col, .28 + pow * .05, 3 + pow * 2); burst(x, y, 8 + pow * 4 | 0, (4 + pow * 3.5) * U, col);
+  flash(x, y, (2 + pow * 1.6) * U, '#fff'); sparks(x, y, 6 + pow * 5 | 0, U * (40 + pow * 25), col);
+  shake = min(40, shake + pow * 7); freeze = max(freeze, .035 + pow * .03);
+}
+function clash(x, y) { flash(x, y, 1.6 * U, '#fff'); sparks(x, y, 6, U * 45, '#fff'); ring(x, y, 3 * U, '#fff', .15, 2); shake = min(40, shake + 2); }
+function drum(a) { ring(a.x, a.y - 5 * U * a.sc, 7 * U * a.sc, '#fff', .45, 3); after(.13, () => ring(a.x, a.y - 5 * U * a.sc, 9.5 * U * a.sc, '#fff', .5, 2)); }
+function wallHit(x, y) {
+  impact(x, y, 2, '#fff'); const L = [], base = x < W / 2 ? 0 : PI;
+  for (let i = 0; i < 7; i++) {
+    let a = base + rr(-1.3, 1.3), px = x, py = y; const pts = [[px, py]];
+    for (let j = 0; j < 4; j++) { a += rr(-.5, .5); const l = rr(1.5, 4.5) * U; px += cos(a) * l; py += sin(a) * l; pts.push([px, py]); }
+    L.push(pts);
+  }
+  addFx({ k: 'crack', L, life: 1.8, rt: true });
+}
+function stepFx(d) {
+  for (let i = fx.length - 1; i >= 0; i--) {
+    const f = fx[i], dd = f.rt ? d : d * wts; f.t += dd / f.life;
+    if (f.k === 'spark') { f.x += f.vx * dd; f.y += f.vy * dd; f.vy += U * 90 * dd; }
+    else if (f.k === 'puff') { f.x += f.vx * dd; f.y += f.vy * dd; f.vx *= 1 - min(1, dd * 4); }
+    if (f.t >= 1) fx.splice(i, 1);
+  }
+  for (let i = ghosts.length - 1; i >= 0; i--) { ghosts[i].t += d / .45; if (ghosts[i].t >= 1) ghosts.splice(i, 1); }
+}
+function drawFx() {
+  ctx.lineCap = 'round';
+  for (const f of fx) {
+    const t = f.t, o = 1 - t;
+    switch (f.k) {
+      case 'ring': ctx.globalAlpha = o; ctx.strokeStyle = f.col; ctx.lineWidth = f.lw * o + .5; ctx.beginPath(); ctx.arc(f.x, f.y, f.r * E.out(t), 0, TAU); ctx.stroke(); break;
+      case 'burst': ctx.globalAlpha = o; ctx.strokeStyle = f.col; ctx.lineWidth = 3 * o + 1; ctx.beginPath();
+        for (const [a, m] of f.L) { const r0 = f.len * m * E.out(t) * .9 + U, r1 = r0 + f.len * m * .5 * o; ctx.moveTo(f.x + cos(a) * r0, f.y + sin(a) * r0); ctx.lineTo(f.x + cos(a) * r1, f.y + sin(a) * r1); }
+        ctx.stroke(); break;
+      case 'spark': ctx.globalAlpha = o; ctx.strokeStyle = f.col; ctx.lineWidth = 2.2; ctx.beginPath(); ctx.moveTo(f.x, f.y); ctx.lineTo(f.x - f.vx * .03, f.y - f.vy * .03); ctx.stroke(); break;
+      case 'flash': { ctx.globalAlpha = o; ctx.fillStyle = f.col; const r = f.r * (1 - t * .5); ctx.beginPath(); for (let i = 0; i < 8; i++) { const a = i * PI / 4, q = i % 2 ? r * .2 : r; ctx.lineTo(f.x + cos(a) * q, f.y + sin(a) * q); } ctx.fill(); break; }
+      case 'puff': ctx.globalAlpha = .32 * o; ctx.fillStyle = '#bdbdbd'; ctx.beginPath(); ctx.arc(f.x, f.y, f.r * (1 + t * 1.6), 0, TAU); ctx.fill(); break;
+      case 'slash': ctx.globalAlpha = o; ctx.strokeStyle = f.col; ctx.lineWidth = f.lw * o + .5; ctx.beginPath(); ctx.moveTo(f.x1, f.y1); ctx.lineTo(f.x2, f.y2); ctx.stroke(); break;
+      case 'swoosh': ctx.globalAlpha = .7 * o; ctx.strokeStyle = f.col; ctx.lineWidth = U * .8 * o + .5; ctx.beginPath(); ctx.arc(f.x, f.y, f.r, lerp(f.a0, f.a1, t * .5), f.a1); ctx.stroke(); break;
+      case 'crack': ctx.globalAlpha = 1 - t * t; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.lineJoin = 'miter'; ctx.beginPath(); for (const pts of f.L) { ctx.moveTo(pts[0][0], pts[0][1]); for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]); } ctx.stroke(); ctx.lineJoin = 'round'; break;
+      case 'mark': { const s = U * (1.1 + .35 * sin(time * 34 + f.x)); ctx.globalAlpha = .9; ctx.strokeStyle = TEAL; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(f.x - s, f.y - s); ctx.lineTo(f.x + s, f.y + s); ctx.moveTo(f.x + s, f.y - s); ctx.lineTo(f.x - s, f.y + s); ctx.stroke(); break; }
+      case 'bolt': { const b = typeof f.b === 'function' ? f.b() : f.b; ctx.globalAlpha = 1; drawBolt(f.a.x, f.a.y, b.x, b.y, 4 * o + 1.5); break; }
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+function stepBullets(d) {
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i]; b.x += b.vx * d; b.y += b.vy * d;
+    if (b.st === 0 && (b.x - G.x) * sgn(b.vx) >= -U * .2 && abs(b.y - (G.y - 5 * U)) < 5 * U) { b.st = 1; b.t = .11; b.vx *= .1; b.vy = 0; }
+    else if (b.st === 1) { b.t -= d; if (b.t <= 0) { b.st = 2; b.vx = -b.vx * 11; b.vy = rr(-7, 7) * U; } }
+    if (b.x < -100 || b.x > W + 100 || b.y < -100 || b.y > H + 100) bullets.splice(i, 1);
+  }
+}
+
+/* ---------- the speed implant ---------- */
+function sandOn() {
+  if (sand) return; sand = true; wts = .05; G.ts = .05; S.ghost = true;
+  ring(S.x, S.y - 5 * U, 16 * U, TEAL, .4, 3, true); flash(S.x, S.y - 5 * U, 3 * U, TEAL, true);
+}
+function sandOff() { sand = false; wts = 1; G.ts = 1; }
+function mark(x, y) { marks.push(addFx({ k: 'mark', x, y, life: 1e9 })); slash(x - 2.5 * U, y - 2.5 * U, x + 2.5 * U, y + 2.5 * U, '#fff', 4, .25, true); }
+function* detonate(def, vx, vy, o) {
+  sandOff(); S.ghost = false;
+  for (const m of marks) { m.life = .01; impact(m.x, m.y, 1.3, SC); def.wob = 1; yield .07; }
+  marks = [];
+  if (vx !== undefined) def.launch(vx, vy, o);
+}
+function* sdash(x, y = GY, dur = .08, pose = 'dash', faceTo) {
+  x = cx(x); y = min(y, GY); S.dir = faceTo ? sgn(faceTo.x - x) : sgn(x - S.x);
+  P(S, pose, dur); yield S.to({ x, y }, dur, 'io');
+}
+
+/* ---------- choreography helpers ---------- */
+function* approach(dist) {
+  const gl = G.x <= S.x ? -1 : 1, m = clamp((G.x + S.x) / 2, EDGE + dist / 2, W - EDGE - dist / 2);
+  const gx = m + gl * dist / 2, sx = m - gl * dist / 2, dg = abs(gx - G.x), ds = abs(sx - S.x), far = max(dg, ds) > 40 * U;
+  const tg = dg / (U * (far ? 130 : 60)), tS = ds / (U * (far ? 175 : 70));
+  if (dg > U) { G.dir = sgn(gx - G.x); G.cycle = 'run'; G.wheel = far ? 1 : 0; G.to({ x: gx }, tg, 'lin'); after(tg, () => { G.cycle = null; G.wheel = 0; face(G, S); P(G, 'guard', .12); }); }
+  if (ds > U) { S.dir = sgn(sx - S.x); S.cycle = 'run'; S.lean = far ? .9 : .45; S.ghost = far; S.to({ x: sx }, tS, 'lin'); after(tS, () => { S.cycle = null; S.ghost = false; S.lean = .45; face(S, G); P(S, 'guard', .12); if (far) dust(S.x, 5, S.dir); }); }
+  yield max(dg > U ? tg : 0, ds > U ? tS : 0) + .04;
+  faceBoth(); yield .08;
+}
+function* settle() {
+  yield* until(() => !G.phys && !S.phys, 6);
+  if (sand) sandOff();
+  for (const m of marks) m.life = .01; marks = [];
+  for (const a of [G, S]) {
+    a.phys = false; a.cycle = null; a.wheel = 0; a.gat = 0; a.glitch = 0; a.gun = 0; a.hold = 0; a.x = cx(a.x);
+    let r = a.rot % TAU; if (r > PI) r -= TAU; if (r < -PI) r += TAU; a.rot = r;
+    a.to({ y: GY, rot: 0, sc: 1, sx: 1, sy: 1, neck: 0, balloon: 0, bulge: 0 }, .18);
+    for (const l of [a.rf, a.rb, a.lf, a.lb]) tw(l, { k: 0, fist: 0 }, .15, 'out', a);
+  }
+  S.ghost = false; S.lean = .45; G.lean = .35;
+  yield .2; faceBoth(); P(G, 'guard', .15); P(S, 'guard', .15); yield .12;
+}
+
+const MOVES = {
+  jab: { s: 'jab', lunge: .8, h: 6.6, t: .07, pow: 1, limb: 'rf' },
+  cross: { w: 'wind', wt: .09, s: 'cross', lunge: 1.4, h: 6.4, t: .08, pow: 1.3, limb: 'rb' },
+  hook: { w: 'wind', wt: .08, s: 'hook', lunge: 1, h: 7, t: .08, pow: 1.3 },
+  upper: { w: 'crouch', wt: .1, s: 'upper', lunge: 1, h: 7.6, t: .08, pow: 1.6, up: true },
+  kick: { w: 'chamber', wt: .08, s: 'kick', lunge: .6, h: 4.5, t: .09, pow: 1.4, limb: 'lf' },
+  high: { w: 'chamber', wt: .09, s: 'high', lunge: .8, h: 8, t: .09, pow: 1.6, limb: 'lf' },
+  sweep: { w: 'crouch', wt: .09, s: 'sweep', lunge: 1, h: .8, t: .1, pow: 1.2, low: true },
+  knee: { w: 'chamber', wt: .06, s: 'knee', lunge: 2, h: 5, t: .08, pow: 1.4 },
+  spin: { w: 'wind', wt: .1, s: 'high', lunge: 1, h: 7, t: .11, pow: 1.8, spin: true }
+};
+function* strike(a, d, mn, resp) {
+  const m = MOVES[mn];
+  if (m.w) { P(a, m.w, m.wt); yield m.wt; }
+  if (m.spin) { a.to({ sx: -1 }, m.t * .5, 'lin'); after(m.t * .5, () => a.to({ sx: 1 }, m.t * .5, 'lin')); }
+  P(a, m.s, m.t); nudge(a, m.lunge * U, m.t);
+  const iy = GY - m.h * U, ix = d.x - a.dir * U;
+  swoosh(a.x + a.dir * 2.2 * U, iy, 3 * U, a.dir, a.col);
+  let rl = null;
+  if (a === G && m.limb && rnd() < .6) { rl = G[m.limb]; rl.t = { x: ix + a.dir * U, y: iy }; rl.fist = .9; tw(rl, { k: 1 }, m.t, 'in', G); }
+  if (resp === 'block') P(d, 'block', .06);
+  else if (resp === 'duck') P(d, 'duck', .07);
+  else if (resp === 'lean') { P(d, 'lean', .07); d.to({ x: cx(d.x + a.dir * 1.3 * U) }, .1); }
+  else if (resp === 'hop') { P(d, 'tuck', .08); d.to({ y: GY - 4.5 * U }, .13, 'out'); }
+  yield m.t;
+  if (resp === 'hit') {
+    impact(ix, iy, m.pow * .8, a.col); P(d, m.low ? 'trip' : m.up ? 'hurtUp' : 'hurt', .06);
+    d.to({ x: cx(d.x + a.dir * (1.2 + m.pow) * U) }, .2); d.wob = d === G ? 1 : .3;
+    if (d === G && !m.low && !m.up) { G.bulge = 1.2; G.to({ bulge: 0 }, .5, 'elastic'); }
+    if (m.up) { d.to({ y: GY - 3 * U }, .12, 'out'); after(.12, () => d.to({ y: GY }, .12, 'in')); }
+    yield .22;
+  } else if (resp === 'block') { clash(ix, iy); d.to({ x: cx(d.x + a.dir * .9 * U) }, .1); yield .1; }
+  else { yield .09; if (resp === 'hop') { d.to({ y: GY }, .1, 'in'); yield .1; } }
+  if (rl) tw(rl, { k: 0, fist: 0 }, .14, 'out', G);
+  P(a, 'guard', .1); if (resp !== 'hit') P(d, 'guard', .1);
+}
+function* finisher(a, d) {
+  face(a, d);
+  if (a === G) {
+    P(G, 'wind', .15); G.rb.fist = 1; tw(G.rb, { fist: 5 }, .3, 'back', G); yield .32;
+    const t = chest(d); G.rb.t = t; P(G, 'cross', .08); tw(G.rb, { k: 1 }, .09, 'in', G); yield .09;
+    impact(t.x, t.y, 2.6, GC); d.launch(G.dir * U * rr(110, 170), -U * rr(45, 65)); tw(t, { x: t.x + G.dir * 8 * U }, .1); yield .15;
+    tw(G.rb, { k: 0, fist: 0 }, .25, 'back', G); yield .25; P(G, 'guard', .15);
+  } else {
+    sandOn(); yield .15;
+    for (let i = 0; i < 4; i++) {
+      const side = i % 2 ? 1 : -1;
+      yield* sdash(G.x + side * MELEE * .9, GY, .07, pick(['jab', 'kick', 'hook', 'knee']), G);
+      mark(G.x + rr(-1, 1) * U, GY - rr(3.5, 8) * U); yield .09;
+    }
+    const side = G.x < W / 2 ? -1 : 1;
+    yield* sdash(G.x + side * MELEE * .8, GY, .07, 'upper', G); mark(G.x, GY - 8.5 * U); yield .14; P(S, 'guard', .1); yield .08;
+    yield* detonate(G, -side * U * rr(100, 160), -U * rr(55, 75));
+  }
+  yield* until(() => !d.phys, 5);
+}
+
+/* ---------- fight patterns ---------- */
+function* seqTrade() {
+  yield* approach(MELEE);
+  let a = rnd() < .5 ? G : S, d = other(a), chain = 0; const n = 7 + (rnd() * 8 | 0), names = Object.keys(MOVES);
+  for (let i = 0; i < n; i++) {
+    face(a, d); face(d, a);
+    const want = cx(d.x - a.dir * MELEE); if (abs(want - a.x) > U * .5) { a.to({ x: want }, .07); yield .05; }
+    const mn = pick(names), m = MOVES[mn]; let resp;
+    if (a === S && rnd() < .22) { // blink behind
+      S.ghost = true; ring(S.x, GY - 5 * U, 5 * U, TEAL, .2, 2); S.to({ x: cx(d.x + S.dir * MELEE) }, .07, 'io'); yield .08;
+      face(S, d); S.ghost = false; resp = 'hit';
+    } else if (chain < 2 && rnd() < .38) resp = 'hit';
+    else resp = pick(m.low ? ['hop', 'hop', 'hit'] : m.h > 6 ? ['block', 'duck', 'lean'] : ['block', 'lean', 'block']);
+    yield* strike(a, d, mn, resp);
+    if (resp === 'hit') { chain++; if (chain >= 3 || rnd() < .35) { [a, d] = [d, a]; chain = 0; yield .06; } }
+    else { [a, d] = [d, a]; chain = 0; }
+  }
+  yield* finisher(a, d);
+}
+
+function* seqGiantFist() {
+  yield* approach(24 * U);
+  P(G, 'wind', .2); G.rf.fist = 1; tw(G.rf, { fist: 3.6 }, .5, 'elastic', G); drum(G); yield .55;
+  const t = chest(S); t.y -= U; G.rf.t = t; P(G, 'jab', .08); tw(G.rf, { k: 1 }, .13, 'in', G); tw(G.rf, { fist: 6.5 }, .12, 'out', G);
+  if (rnd() < .5) {
+    yield .13; impact(t.x, t.y, 3, GC); S.launch(G.dir * U * rr(140, 190), -U * rr(40, 60)); tw(t, { x: t.x + G.dir * 9 * U }, .12); yield .2;
+    tw(G.rf, { k: 0 }, .28, 'back', G); tw(G.rf, { fist: 0 }, .3, 'in', G); yield .3;
+    G.cycle = 'laugh'; yield* until(() => !S.phys, 5); G.cycle = null;
+  } else {
+    yield .09; sandOn(); P(S, 'lean', .1); yield .3;
+    const sh = { x: G.x, y: GY - 7.5 * U }, hd = G.joints().h1;
+    const at = u => ({ x: lerp(sh.x, hd[0], u), y: lerp(sh.y, hd[1], u) - .3 * U });
+    let q = at(.72); P(S, 'tuck', .1); S.dir = -G.dir; yield S.to({ x: q.x, y: q.y }, .16, 'out');
+    q = at(.12); S.cycle = 'run'; yield S.to({ x: q.x, y: q.y }, .38, 'lin'); S.cycle = null;
+    P(S, 'knee', .06); mark(G.x, GY - 8.5 * U); yield .12;
+    P(S, 'tuck', .08); S.to({ rot: S.dir * TAU }, .22, 'lin'); S.to({ x: cx(G.x - G.dir * 4.5 * U) }, .22, 'lin');
+    yield S.to({ y: GY - 13 * U }, .11, 'out'); yield S.to({ y: GY }, .11, 'in'); S.rot = 0; face(S, G);
+    P(S, 'cross', .06); mark(G.x, GY - 5.5 * U); yield .12; P(S, 'high', .07); mark(G.x, GY - 8 * U); yield .16; P(S, 'guard', .1); yield .1;
+    yield* detonate(G, sgn(G.x - S.x) * U * rr(110, 150), -U * rr(50, 70));
+    tw(G.rf, { k: 0, fist: 0 }, .2, 'out', G);
+    yield* until(() => !G.phys, 5);
+  }
+}
+
+function* seqGatling() {
+  yield* approach(17 * U);
+  P(G, 'wind', .15); yield .2; P(G, 'palms', .08); G.gat = 1; P(S, 'block', .08);
+  for (let i = 0; i < 9; i++) {
+    const c = chest(S); clash(c.x - S.dir * 2 * U + rr(-1, 1) * U, c.y + rr(-3, 3) * U);
+    S.to({ x: cx(S.x - S.dir * 1.1 * U) }, .08); G.to({ x: cx(G.x + G.dir * U) }, .08);
+    if (i % 3 === 0) dust(S.x, 2, -S.dir); yield .085;
+  }
+  sandOn(); yield .25; P(S, 'stand', .2); yield .3;
+  const sd = S.dir;
+  S.lean = .05; S.cycle = 'run'; yield S.to({ x: S.x + sd * max(0, abs(G.x - S.x) - MELEE * 1.6) * .5 }, .5, 'lin'); S.cycle = null;
+  P(S, 'duck', .1); yield S.to({ x: G.x - sd * MELEE * .9 }, .35, 'io'); S.lean = .45;
+  P(S, 'upper', .07); mark(G.x, GY - 8.6 * U); yield .16;
+  P(S, 'knee', .06); mark(G.x, GY - 5 * U); yield .14;
+  yield* sdash(G.x + sd * MELEE, GY, .08, 'guard', G);
+  P(S, 'high', .07); mark(G.x, GY - 8 * U); yield .16; P(S, 'stand', .15); yield .2;
+  G.gat = 0;
+  yield* detonate(G, sgn(G.x - S.x) * U * 130, -U * 70);
+  P(S, 'guard', .15);
+  yield* until(() => !G.phys, 5);
+}
+
+function* seqBullets() {
+  yield* approach(10 * U);
+  const d = S.dir; P(S, 'tuck', .1); S.to({ x: cx(S.x - d * 17 * U) }, .42, 'lin'); S.to({ rot: -d * TAU }, .42, 'lin');
+  yield S.to({ y: GY - 9 * U }, .21, 'out'); yield S.to({ y: GY }, .21, 'in'); S.rot = 0; dust(S.x, 4); face(S, G);
+  P(S, 'gun', .08); S.gun = 1; P(G, 'stand', .2); yield .18;
+  for (let i = 0; i < 6; i++) {
+    const h = S.joints().h1, c = chest(G), L = Math.hypot(c.x - h[0], c.y - h[1]) || 1, v = U * 210;
+    flash(h[0] + S.dir * 1.6 * U, h[1], 1.5 * U, '#ffe9a0');
+    bullets.push({ x: h[0] + S.dir * 1.5 * U, y: h[1], vx: (c.x - h[0]) / L * v, vy: (c.y + rr(-1.5, 1.5) * U - h[1]) / L * v, st: 0, t: 0 });
+    S.to({ x: cx(S.x - S.dir * .3 * U) }, .05); yield .085;
+  }
+  yield* until(() => bullets.some(b => b.st > 0) || !bullets.length, 1.5);
+  G.to({ bulge: 1.7 }, .1, 'out'); P(G, 'hurt', .1); yield .15;
+  G.to({ bulge: 0 }, .5, 'elastic'); ring(G.x, GY - 5 * U, 6 * U, GC, .3, 3); G.cycle = 'laugh'; yield .06;
+  sandOn(); P(S, 'lean', .1); yield .35; S.gun = 0;
+  const pass = G.x - S.dir * MELEE;
+  P(S, 'tuck', .1); S.to({ x: pass }, .4, 'lin'); S.to({ rot: S.dir * TAU }, .4, 'lin');
+  yield S.to({ y: GY - 11 * U }, .2, 'out'); yield S.to({ y: GY }, .2, 'in'); S.rot = 0;
+  P(S, 'knee', .06); mark(G.x, GY - 5 * U); yield .13; P(S, 'hook', .06); mark(G.x, GY - 8.4 * U); yield .13;
+  yield* sdash(G.x + S.dir * MELEE, GY, .08, 'guard', G); P(S, 'kick', .07); mark(G.x, GY - 4.6 * U); yield .16; P(S, 'guard', .1);
+  G.cycle = null;
+  yield* detonate(G, sgn(G.x - S.x) * U * 130, -U * 60);
+  yield* until(() => !G.phys, 5);
+}
+
+function* seqLightning() {
+  yield* approach(28 * U);
+  P(G, 'crouch', .12); yield .14; P(G, 'reachUp', .12); dust(G.x, 6); yield G.to({ y: GY - 19 * U }, .35, 'out');
+  const hand = () => { const j = G.joints().h1; return { x: j[0], y: j[1] }; };
+  addFx({ k: 'bolt', a: { x: G.x + rr(-8, 8) * U, y: -20 }, b: hand, life: .28, rt: true });
+  const h0 = hand(); flash(h0.x, h0.y, 5 * U, '#fff'); ring(h0.x, h0.y, 12 * U, '#bfe4ff', .4, 4); shake += 12;
+  yield .3; G.hold = 1; G.cycle = 'laugh'; drum(G); yield .6; G.cycle = null;
+  P(G, 'wind', .12); yield .14; face(G, S); P(G, 'jab', .07); yield .05; G.hold = 0;
+  const s = hand(), tg = { x: S.x, y: GY }, L = Math.hypot(tg.x - s.x, tg.y - s.y) || 1, dur = .22;
+  const jv = jav = { x: s.x, y: s.y, dx: (tg.x - s.x) / L, dy: (tg.y - s.y) / L }; tw(jv, { x: tg.x, y: tg.y }, dur, 'lin');
+  const dodge = rnd() < .6;
+  spawn((function* () {
+    yield* until(() => jav !== jv || jv.y >= tg.y - 1, 30); if (jav !== jv) return; jav = null;
+    impact(tg.x, tg.y, 3.2, '#bfe4ff'); ring(tg.x, tg.y, 20 * U, '#fff', .6, 5); dust(tg.x, 16); sparks(tg.x, tg.y, 24, U * 90, '#bfe4ff');
+    for (let i = 0; i < 3; i++) addFx({ k: 'bolt', a: { x: tg.x, y: tg.y }, b: { x: tg.x + rr(-12, 12) * U, y: tg.y - rr(6, 16) * U }, life: .25 });
+    if (!dodge) S.launch(sgn(S.x - G.x) * U * rr(120, 170), -U * rr(65, 85));
+  })());
+  if (dodge) {
+    yield dur * .5; sandOn(); P(S, 'lean', .1); yield .3;
+    S.lean = .1; S.dir = sgn(G.x - S.x); S.cycle = 'run'; yield S.to({ x: S.x + S.dir * 9 * U }, .45, 'lin'); S.cycle = null; S.lean = .45;
+    const sd = sgn(S.x - G.x);
+    yield* sdash(G.x + sd * 3.2 * U, G.y + U, .12, 'knee', G); mark(G.x, G.y - 5 * U); yield .12;
+    P(S, 'tuck', .06); S.to({ rot: -sd * TAU }, .16, 'lin'); yield S.to({ x: G.x, y: G.y - 11 * U }, .16, 'io'); S.rot = 0;
+    P(S, 'stomp', .06); yield S.to({ y: G.y - 9.3 * U }, .06, 'in'); mark(G.x, G.y - 9 * U); yield .14;
+    yield* detonate(G, -sd * U * 40, U * 120, { bounces: 2 });
+    P(S, 'tuck', .1); yield S.to({ y: GY }, .32, 'in'); P(S, 'land', .08); dust(S.x, 6);
+    yield* until(() => !G.phys, 5);
+  } else {
+    yield dur + .1; G.cycle = 'laugh'; yield G.to({ y: GY }, .4, 'in'); dust(G.x, 6);
+    yield* until(() => !S.phys, 5); G.cycle = null;
+  }
+}
+
+function* seqRubberGround() {
+  yield* approach(24 * U);
+  P(G, 'grab', .15); yield .25; P(G, 'armsUp', .1);
+  const gw = gwave = { x: G.x + G.dir * 3 * U, amp: 0 }; tw(gw, { amp: 7 }, .15, 'out'); shake += 6;
+  const t = abs(S.x - gw.x) / (U * 110); tw(gw, { x: S.x }, t, 'lin'); yield t;
+  ring(S.x, GY, 5 * U, GC, .25, 3); S.launch(rr(-10, 10) * U, -U * 95, { spin: S.dir * 10, bounces: 0 });
+  tw(gw, { amp: 0 }, .3, 'out'); after(.35, () => { if (gwave === gw) gwave = null; });
+  G.cycle = 'laugh'; yield .45; G.cycle = null; face(G, S);
+  if (rnd() < .5) {
+    P(G, 'high', .1); G.lf.t = () => ({ x: S.x, y: S.y - 4 * U }); G.lf.fist = 2.2; tw(G.lf, { k: 1 }, .22, 'in', G); yield .22;
+    const pt = { x: S.x, y: S.y - 4 * U }; G.lf.t = pt; impact(pt.x, pt.y, 2.6, GC);
+    S.launch((S.x < W / 2 ? 1 : -1) * U * rr(150, 200), -U * rr(10, 30)); yield .12;
+    tw(G.lf, { k: 0, fist: 0 }, .25, 'back', G); yield .3; P(G, 'guard', .12);
+    yield* until(() => !S.phys, 5);
+  } else {
+    yield .25; S.phys = false; S.vx = S.vy = 0; S.rot = 0; sandOn(); P(S, 'tuck', .1); yield .25;
+    const side = sgn(S.x - G.x);
+    yield* sdash(G.x + side * 2.2 * U, GY - 6 * U, .14, 'air', G); mark(G.x, GY - 8.3 * U); yield .12;
+    P(S, 'tuck', .08); S.to({ rot: side * TAU }, .2, 'lin'); S.to({ x: cx(G.x + side * 8 * U) }, .2, 'lin');
+    yield S.to({ y: GY - 12 * U }, .1, 'out'); yield S.to({ y: GY }, .1, 'in'); S.rot = 0;
+    slash(S.x, GY - 5 * U, G.x - side * 8 * U, GY - 5 * U, TEAL, 6, .5);
+    yield* sdash(G.x - side * 8 * U, GY, .07, 'cross'); mark(G.x, GY - 5 * U); yield .15; P(S, 'guard', .1);
+    yield* detonate(G, side * U * rr(110, 150), -U * rr(50, 70));
+    yield* until(() => !G.phys, 5);
+  }
+}
+
+function* seqGiant() {
+  yield* approach(30 * U);
+  P(G, 'armsUp', .2); drum(G); G.to({ sc: 3.1 }, .8, 'elastic'); yield .45; drum(G); shake += 8; yield .45;
+  G.cycle = 'laugh'; yield .5; G.cycle = null;
+  let r, tg;
+  for (let i = 0; i < 2; i++) {
+    face(G, S); r = i ? G.rb : G.rf; tg = { x: S.x, y: GY - 1.2 * U };
+    P(G, i ? 'cross' : 'jab', .25, 'out'); r.t = tg; r.fist = 1.3; tw(r, { k: 1 }, .3, 'in', G); yield .2;
+    S.ghost = true; P(S, 'dash', .05); yield S.to({ x: cx(S.x + sgn(S.x - G.x) * 13 * U) }, .1, 'io'); S.ghost = false; face(S, G); P(S, 'guard', .1);
+    impact(tg.x, tg.y, 2.5, GC); dust(tg.x, 14); shake += 14; yield .25;
+    if (i === 0) { tw(r, { k: 0, fist: 0 }, .3, 'out', G); yield .2; }
+  }
+  sandOn(); yield .1;
+  yield* sdash(tg.x, tg.y - 2 * U, .1, 'tuck');
+  S.dir = sgn(G.x - S.x); S.cycle = 'run'; yield S.to({ x: G.x - S.dir * 2 * U, y: GY - 7.6 * U * G.sc }, .4, 'lin'); S.cycle = null;
+  const hx = G.x, hy = GY - 6 * U * G.sc;
+  for (let i = 0; i < 6; i++) {
+    const a = rnd() * TAU, tx = hx + cos(a) * 12 * U, ty = hy + sin(a) * 9 * U;
+    slash(S.x, S.y - 5 * U, tx, min(ty, GY) - 5 * U, TEAL, 6, .5);
+    yield* sdash(tx, ty, .07, pick(['cross', 'kick', 'dash'])); mark(hx + rr(-3, 3) * U, hy + rr(-6, 6) * U); yield .07;
+  }
+  yield* sdash(G.x, GY - 9.5 * U * G.sc - 3 * U, .08, 'stomp'); mark(G.x, GY - 9 * U * G.sc); yield .2;
+  yield* detonate(G);
+  tw(r, { k: 0, fist: 0 }, .1, 'out', G); P(G, 'fly', .1);
+  spawn((function* () { P(S, 'tuck', .1); yield S.to({ y: GY }, .35, 'in'); P(S, 'land', .08); dust(S.x, 6); yield .4; P(S, 'stand', .2); })());
+  // deflate like a balloon, whizzing around every screen
+  let ang = -PI / 2 + rr(-.6, .6), t = 0, px = G.x, py = GY - 8 * U; const dur = 1.8, turn = rr(4, 7) * (rnd() < .5 ? -1 : 1);
+  G.to({ sc: 1 }, dur, 'lin');
+  while (t < dur) {
+    const d = sdt; t += d; ang += turn * d + sin(t * 9) * d * 6; px += cos(ang) * U * 150 * d; py += sin(ang) * U * 150 * d;
+    if (px < EDGE) { px = EDGE; ang = PI - ang; } if (px > W - EDGE) { px = W - EDGE; ang = PI - ang; }
+    if (py < 6 * U) { py = 6 * U; ang = -ang; } if (py > GY - 3 * U) { py = GY - 3 * U; ang = -ang; }
+    G.x = px; G.y = py + 3 * U; G.rot = ang + PI / 2;
+    if (rnd() < .6) addFx({ k: 'puff', x: px, y: py, vx: -cos(ang) * U * 20, vy: -sin(ang) * U * 20, r: rr(.4, 1) * U, life: .4 });
+    yield 0;
+  }
+  G.launch(cos(ang) * U * 50, -U * 30, { bounces: 1 });
+  yield* until(() => !G.phys, 5);
+}
+
+function* seqChase() {
+  const mid = (G.x + S.x) / 2, z = zone(mid); let tx;
+  if (MONS > 1) { let tz; do { tz = rnd() * MONS | 0; } while (tz === z); tx = zoneX(tz) + rr(-.15, .15) * W / MONS; }
+  else tx = mid < W / 2 ? W - EDGE - 12 * U : EDGE + 12 * U;
+  const dir = sgn(tx - mid);
+  S.dir = dir; S.ghost = true; S.cycle = 'run'; S.lean = .9;
+  const sEnd = cx(tx + dir * 8 * U), st = abs(sEnd - S.x) / (U * 150); S.to({ x: sEnd }, st, 'lin');
+  yield .25;
+  G.dir = dir; G.wheel = 1; G.cycle = 'run'; const gEnd = cx(tx - dir * 8 * U), gt = abs(gEnd - G.x) / (U * 140); G.to({ x: gEnd }, gt, 'lin');
+  if (rnd() < .6 && (S.x - G.x) * dir > 4 * U) {
+    yield max(.1, st * .6 - .25);
+    G.rf.t = () => chest(S); G.rf.fist = .9; tw(G.rf, { k: 1 }, .15, 'in', G); yield .15;
+    S.to({ x: S.x }, 0); S.cycle = null; S.ghost = false; P(S, 'hurt', .06); ring(S.x, GY - 5 * U, 3 * U, GC, .2, 2);
+    G.to({ x: G.x }, 0); G.cycle = null; G.wheel = 0; P(G, 'wind', .1); dust(G.x, 6, dir);
+    yield S.to({ x: G.x + dir * 4.5 * U, y: GY - 3 * U }, .16, 'in');
+    tw(G.rf, { k: 0, fist: 0 }, .1, 'out', G); P(G, 'cross', .06); G.rb.fist = 2.5;
+    impact(S.x, GY - 7 * U, 2.5, GC); S.launch(dir * U * rr(150, 185), -U * rr(50, 60)); yield .2;
+    tw(G.rb, { fist: 0 }, .2, 'out', G); P(G, 'guard', .15);
+    yield* until(() => !S.phys, 5);
+  } else {
+    yield max(st - .25, gt) + .02;
+    S.cycle = null; S.ghost = false; S.lean = .45; G.cycle = null; G.wheel = 0; dust(S.x, 8, dir); dust(G.x, 8, dir);
+    faceBoth(); P(S, 'guard', .12); P(G, 'guard', .12); yield .2;
+  }
+  S.lean = .45;
+}
+
+function* seqSling() {
+  yield* approach(18 * U);
+  P(G, 'jab', .08); G.rf.t = () => chest(S); G.rf.fist = .9; tw(G.rf, { k: 1 }, .12, 'in', G); P(S, 'block', .08); yield .13;
+  ring(S.x, S.y - 5 * U, 3 * U, GC, .2, 2); P(S, 'hurt', .08); P(G, 'reachUp', .1);
+  const piv = { x: G.x, y: GY - 10 * U }, want = G.x < W / 2 ? 1 : -1;
+  let R = Math.hypot(S.x - piv.x, S.y - 5.2 * U - piv.y), th = Math.atan2(S.y - 5.2 * U - piv.y, S.x - piv.x), om = G.dir * 4, t = 0;
+  while (t < 3) {
+    const d = sdt; t += d; om += G.dir * 14 * d; if (abs(om) > 24) om = 24 * sgn(om); th += om * d; R = lerp(R, 15 * U, min(1, d * 4));
+    const qy = min(piv.y + sin(th) * R, GY - 5.2 * U); if (qy !== piv.y + sin(th) * R && rnd() < .5) dust(S.x, 1);
+    S.x = cx(piv.x + cos(th) * R); S.y = qy + 5.2 * U; S.rot = th + PI / 2;
+    const tvx = -sin(th) * om, tvy = cos(th) * om;
+    if (t > 1.3 && sgn(tvx) === want && tvy < -abs(tvx) * .2) break;
+    yield 0;
+  }
+  S.launch(want * U * rr(150, 190), -U * rr(50, 70)); tw(G.rf, { k: 0, fist: 0 }, .25, 'back', G); P(G, 'guard', .15);
+  yield* until(() => S.vy > 0 || !S.phys, 3);
+  if (S.phys) {
+    S.phys = false; S.vx = S.vy = 0; S.rot = 0; S.ghost = true; P(S, 'tuck', .08); ring(S.x, S.y - 5 * U, 8 * U, TEAL, .3, 3); yield .14;
+    const lx = cx(S.x + want * 10 * U); yield* sdash(lx, GY, .14, 'land'); dust(lx, 8, want); yield .25;
+  } else { yield .2; S.ghost = true; }
+  const dg = sgn(G.x - S.x); S.dir = dg; S.cycle = 'run'; S.lean = .9; face(G, S);
+  yield S.to({ x: G.x - dg * 7 * U }, max(.05, abs(G.x - dg * 7 * U - S.x) / (U * 230)), 'lin'); S.cycle = null; S.lean = .45;
+  P(S, 'knee', .06); S.to({ x: G.x - dg * 3.6 * U, y: GY - 2.5 * U }, .1);
+  G.to({ balloon: 1.5 }, .12, 'back'); P(G, 'armsUp', .1); yield .1;
+  ring(G.x, GY - 5 * U, 8 * U, GC, .3, 3); clash(G.x - dg * 3 * U, GY - 5 * U); S.ghost = false;
+  S.launch(-dg * U * 70, -U * 60); G.to({ balloon: 0 }, .5, 'elastic'); G.cycle = 'laugh';
+  yield* until(() => !S.phys, 4); G.cycle = null;
+}
+
+function* seqCross() {
+  yield* approach(20 * U);
+  P(S, 'crouch', .15); ring(S.x, GY - 4 * U, 6 * U, TEAL, .3, 2); yield .25; sandOn();
+  let side = sgn(S.x - G.x); const ys = [0, -6, 0, -9, -3];
+  for (let i = 0; i < 5; i++) {
+    side = -side; const ty = GY + ys[i] * U, tx = cx(G.x + side * 11 * U);
+    slash(S.x, S.y - 5 * U, tx, ty - 5 * U, TEAL, 6, .5);
+    yield* sdash(tx, ty, .07, pick(['cross', 'dash', 'kick'])); mark(G.x + rr(-1, 1) * U, GY - rr(3, 8) * U); yield .1;
+  }
+  yield* sdash(G.x, GY - 14 * U, .09, 'stomp'); yield .1; yield S.to({ y: GY - 9.5 * U }, .06, 'in'); mark(G.x, GY - 9 * U); yield .12;
+  yield* detonate(G);
+  impact(G.x, GY, 2.5, SC); dust(G.x, 14); G.to({ sy: .1, sx: 2.6 }, .07, 'out'); P(G, 'stand', .05);
+  P(S, 'tuck', .08); S.to({ x: cx(S.x + side * 7 * U) }, .3, 'lin'); yield S.to({ y: GY - 13 * U }, .15, 'out'); yield S.to({ y: GY }, .15, 'in');
+  P(S, 'land', .08); face(S, G); yield .5; P(S, 'stand', .2);
+  G.to({ sy: 1.5, sx: .65 }, .18, 'out'); yield .18; G.to({ sy: 1, sx: 1 }, .5, 'elastic'); G.wob = 1; yield .3;
+  G.cycle = 'laugh'; drum(G); yield .7; G.cycle = null; P(S, 'guard', .1);
+}
+
+function* seqOverheat() {
+  yield* approach(20 * U);
+  S.ghost = true; P(S, 'dash', .08); yield .15; S.ghost = false; S.glitch = 1; P(S, 'pant', .2, 'out'); sparks(S.x, S.y - 6 * U, 10, U * 30, '#ff3b3b'); yield .5;
+  G.cycle = 'laugh'; drum(G); yield .8; G.cycle = null;
+  const sh = { x: G.x, y: GY - 7.6 * U }, tp = { x: sh.x, y: sh.y - 7 * U }; let th = 0, om = 6, t = 0;
+  G.rf.t = tp; G.rf.fist = 1; tw(G.rf, { k: 1 }, .2, 'out', G); tw(G.rf, { fist: 4.5 }, 1.2, 'in', G); P(G, 'reachUp', .15);
+  while (t < 1.3) { const d = sdt; t += d; om += d * 22; th += om * d * G.dir; tp.x = sh.x + sin(th) * 7 * U; tp.y = sh.y - cos(th) * 7 * U; yield 0; }
+  S.glitch = 0; P(S, 'block', .07); P(G, 'jab', .07); const c = chest(S); yield tw(tp, { x: c.x - G.dir * 2 * U, y: c.y }, .09, 'in');
+  impact(c.x, c.y, 3, GC); S.to({ x: cx(S.x + G.dir * 42 * U) }, .75, 'out'); tw(tp, { x: c.x + G.dir * 6 * U }, .12, 'out');
+  for (let i = 0; i < 8; i++) { dust(S.x, 3, -G.dir); sparks(S.x, GY, 2, U * 20, SC); yield .07; }
+  tw(G.rf, { k: 0, fist: 0 }, .25, 'back', G); yield .2; P(S, 'guard', .15); S.wob = .6; yield .3;
+}
+
+function* seqAir() {
+  yield* approach(22 * U);
+  let m = (G.x + S.x) / 2, gs = sgn(G.x - S.x); const trav = (m < W / 2 ? 1 : -1) * 13 * U;
+  P(G, 'crouch', .1); P(S, 'crouch', .1); yield .14; S.ghost = true; dust(G.x, 4); dust(S.x, 4);
+  for (let i = 0; i < 5; i++) {
+    m = clamp(m + trav, EDGE + 12 * U, W - EDGE - 12 * U); gs = -gs;
+    const hy = GY - rr(9, 20) * U, gx = m + gs * 10 * U, sx = m - gs * 10 * U, gy = hy + rr(-3, 3) * U + 5 * U, sy = hy + rr(-3, 3) * U + 5 * U;
+    G.dir = sgn(gx - G.x); S.dir = sgn(sx - S.x);
+    P(G, pick(['cross', 'kick', 'jab']), .08); P(S, pick(['cross', 'kick', 'knee']), .08);
+    slash(G.x, G.y - 5 * U, gx, gy - 5 * U, '#fff', 5, .3); slash(S.x, S.y - 5 * U, sx, sy - 5 * U, TEAL, 5, .3);
+    G.to({ x: gx, y: gy }, .13, 'io'); S.to({ x: sx, y: sy }, .13, 'io');
+    yield .065; clash(m, hy); impact(m, hy, i === 4 ? 2.8 : 1.2, '#fff');
+    yield .065; P(G, 'tuck', .1); P(S, 'tuck', .1); yield .12;
+  }
+  S.ghost = false;
+  G.launch(gs * U * 60, -U * 20, { bounces: 0, spin: 0 }); S.launch(-gs * U * 60, -U * 20, { bounces: 0, spin: 0 });
+  P(G, 'tuck', .1); P(S, 'tuck', .1);
+  yield* until(() => !G.phys && !S.phys, 4);
+}
+
+function* seqWhip() {
+  yield* approach(26 * U);
+  P(G, 'chamber', .1); yield .12; P(G, 'kick', .08);
+  const t1 = { x: G.x + G.dir * 6 * U, y: GY - U }; G.lf.t = t1; G.lf.fist = 1; tw(G.lf, { k: 1 }, .05, 'out', G);
+  tw(t1, { x: S.x + G.dir * 8 * U }, .16, 'in'); yield .08; P(S, 'tuck', .07); S.to({ y: GY - 6 * U }, .12, 'out'); yield .1;
+  dust(S.x, 5, G.dir); yield .1; tw(G.lf, { k: 0 }, .14, 'in', G); S.to({ y: GY }, .12, 'in'); yield .14; P(S, 'guard', .08);
+  P(G, 'high', .08); const t2 = { x: G.x + G.dir * 6 * U, y: GY - 8.5 * U }; G.lf.t = t2; tw(G.lf, { k: 1 }, .05, 'out', G); tw(t2, { x: S.x + G.dir * 8 * U }, .15, 'in');
+  yield .07; S.ghost = true; P(S, 'duck', .06); dust(S.x, 4, -S.dir); yield S.to({ x: G.x + G.dir * MELEE * .9 }, .16, 'io'); S.ghost = false;
+  P(S, 'upper', .07); yield .06; impact(G.x + G.dir * U, GY - 9 * U, 1.8, SC);
+  P(G, 'hurtUp', .08); tw(G.lf, { k: 0, fist: 0 }, .15, 'out', G); G.to({ neck: 13 }, .16, 'out'); yield .3; P(S, 'stand', .15); yield .35;
+  G.to({ neck: 0 }, .1, 'in'); P(G, 'duck', .1); yield .1;
+  impact(S.x, GY - 8 * U, 2.4, GC); S.launch(G.dir * U * rr(110, 150), -U * 45); G.wob = 1; yield .15; G.cycle = 'laugh';
+  yield* until(() => !S.phys, 5); G.cycle = null;
+}
+
+function* seqBazooka() {
+  yield* approach(15 * U);
+  P(G, 'pull', .15); const b = { x: G.x - G.dir * 4 * U, y: GY - 7 * U };
+  G.rf.t = b; G.rb.t = b; G.rf.fist = G.rb.fist = 1.6; tw(G.rf, { k: 1 }, .1, 'out', G); tw(G.rb, { k: 1 }, .1, 'out', G);
+  yield tw(b, { x: G.x - G.dir * 34 * U }, .4, 'out'); drum(G); yield .1;
+  const counter = rnd() < .4, c = chest(S); P(G, 'palms', .07);
+  if (counter) { S.ghost = true; P(S, 'dash', .05); S.to({ x: cx(G.x - G.dir * MELEE) }, .09, 'io'); }
+  yield tw(b, { x: c.x, y: c.y }, .1, 'in');
+  if (!counter) {
+    impact(c.x, c.y, 3.2, GC); ring(c.x, c.y, 16 * U, GC, .5, 4); S.launch(G.dir * U * rr(170, 210), -U * rr(35, 50)); tw(b, { x: c.x + G.dir * 7 * U }, .1); yield .2;
+    tw(G.rf, { k: 0, fist: 0 }, .25, 'back', G); tw(G.rb, { k: 0, fist: 0 }, .25, 'back', G); yield .3; P(G, 'guard', .12);
+    yield* until(() => !S.phys, 5);
+  } else {
+    ring(c.x, c.y, 10 * U, GC, .3, 2); S.dir = G.dir; S.ghost = false; P(S, 'kick', .07); yield .07;
+    impact(G.x, GY - 4.5 * U, 2, SC); tw(G.rf, { k: 0, fist: 0 }, .2, 'out', G); tw(G.rb, { k: 0, fist: 0 }, .2, 'out', G);
+    G.launch(G.dir * U * 90, -U * 40); P(S, 'guard', .15);
+    yield* until(() => !G.phys, 5);
+  }
+}
+
+const SEQ = { trade: seqTrade, giantfist: seqGiantFist, gatling: seqGatling, bullets: seqBullets, lightning: seqLightning, ground: seqRubberGround, giant: seqGiant, chase: seqChase, sling: seqSling, cross: seqCross, overheat: seqOverheat, air: seqAir, whip: seqWhip, bazooka: seqBazooka };
+const SETPIECES = Object.keys(SEQ).filter(k => k !== 'trade');
+
+/* ---------- director ---------- */
+function* intro() {
+  faceBoth(); P(G, 'stand', .01); P(S, 'stand', .01); yield .6;
+  G.cycle = 'laugh'; drum(G); yield .5; drum(G); yield .5; G.cycle = null; P(G, 'guard', .15);
+  S.ghost = true; ring(S.x, S.y - 5 * U, 12 * U, TEAL, .4, 3); P(S, 'guard', .12); yield .3; S.ghost = false; yield .2;
+}
+function* main(skipIntro) {
+  if (!skipIntro) yield* intro();
+  let bag = [], since = 0, lastZone = zone(G.x), lastTrade = false;
+  while (true) {
+    let name;
+    if (FORCE && SEQ[FORCE]) name = FORCE;
+    else {
+      const z = zone((G.x + S.x) / 2); if (z === lastZone) since++; else { since = 0; lastZone = z; }
+      if (MONS > 1 && since >= 3) { name = 'chase'; since = 0; }
+      else if (!lastTrade && rnd() < .45) name = 'trade';
+      else { if (!bag.length) bag = SETPIECES.slice().sort(() => rnd() - .5); name = bag.pop(); }
+    }
+    lastTrade = name === 'trade'; curSeq = name; seqStart = time;
+    yield* SEQ[name]();
+    yield* settle();
+    yield rr(.15, .5);
+  }
+}
+function clearWorld() {
+  procs = []; tweens.length = 0; bullets = []; marks = []; gwave = null; jav = null; fx = fx.filter(f => f.k !== 'mark');
+  wts = 1; sand = false; freeze = 0;
+}
+function resetAll() {
+  clearWorld(); fx = []; ghosts = [];
+  const c = zoneX((MONS / 2) | 0); G.reset(c - 9 * U); S.reset(c + 9 * U); faceBoth(); seqStart = time; spawn(main(false));
+}
+function restart() { // soft recovery: keep positions, restart the director
+  clearWorld();
+  for (const a of [G, S]) { const x = cx(isFinite(a.x) ? a.x : W / 2); a.reset(x); }
+  if (abs(G.x - S.x) < U) S.x = cx(G.x + 10 * U);
+  faceBoth(); seqStart = time; spawn(main(true));
+}
+function resize() {
+  W = cv.width = innerWidth; H = cv.height = innerHeight; U = max(6, H / 56); GY = Math.round(H * .86);
+  EDGE = 4 * U; MONS = max(1, Math.round(W / H / 1.78)); MELEE = 5.4 * U;
+  resetAll();
+}
+
+/* ---------- frame ---------- */
+function frame(dt) {
+  time += dt;
+  let d = dt; if (freeze > 0) { freeze -= dt; d = dt * .05; }
+  sdt = d; shake *= Math.exp(-dt * 9); sandA += ((sand ? 1 : 0) - sandA) * min(1, dt * 10);
+  try {
+    stepProcs(d); stepTweens(d); G.update(d); S.update(d); stepBullets(d * wts); stepFx(d);
+    if (time - seqStart > 40 || !isFinite(G.x + G.y + S.x + S.y)) restart();
+  } catch (e) { lastErr = (curSeq || '?') + ': ' + (e && e.stack || e); console.error(lastErr); restart(); }
+}
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  if (shake > .3) ctx.translate(rr(-1, 1) * shake, rr(-1, 1) * shake);
+  if (sandA > .02) {
+    ctx.strokeStyle = TEAL; ctx.lineWidth = 1.5; ctx.globalAlpha = .13 * sandA; ctx.beginPath();
+    for (let i = 0; i < 28; i++) {
+      const y = hs(i + 1) * H, len = 150 + hs(i * 3.7) * 400, x = ((hs(i * 9.1) * W + time * W * .5 * (.4 + hs(i * 5.3))) % (W + 800)) - 400;
+      ctx.moveTo(x, y); ctx.lineTo(x + len, y);
+    }
+    ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  if (gwave && gwave.amp > .05) {
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = .45 * U; ctx.lineCap = 'round'; ctx.beginPath();
+    for (let i = -34; i <= 34; i++) { const x = gwave.x + i * U, y = GY - gwave.amp * U * Math.exp(-((i / 6) ** 2)) * (1 + .15 * sin(time * 30 + i)); if (i === -34) ctx.moveTo(x, y); else ctx.lineTo(x, y); }
+    ctx.globalAlpha = min(1, gwave.amp / 3); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  for (const g of ghosts) drawFig(g.J, 'hsl(' + g.hue + ',100%,60%)', .55 * (1 - g.t), true);
+  const Jg = G.joints(), Js = S.joints();
+  if (sandA > .3) { ctx.save(); ctx.translate(-3, 0); drawFig(Jg, '#00e5ff', .45, true); ctx.translate(6, 0); drawFig(Jg, '#ff2bd6', .45, true); ctx.restore(); }
+  if (G.gat) {
+    const f = G.gatT * 26 | 0; ctx.strokeStyle = ctx.fillStyle = GC; ctx.lineWidth = Jg.lw; ctx.lineCap = 'round';
+    for (let i = 0; i < 8; i++) {
+      const a = (hs(i * 7.3 + f * 1.7) - .5) * .75, L = (8 + hs(i * 3.1 + f * 2.3) * 8) * U, x = Jg.nk[0] + cos(a) * L * G.dir, y = Jg.nk[1] + sin(a) * L + U;
+      ctx.globalAlpha = .5 + .5 * hs(i + f); ctx.beginPath(); ctx.moveTo(Jg.nk[0], Jg.nk[1]); ctx.lineTo(x, y); ctx.stroke(); ctx.beginPath(); ctx.arc(x, y, U * 1.05, 0, TAU); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+  drawFig(Jg, GC, 1); drawToon(Jg);
+  if (G.hold) drawBolt(Jg.h1[0] - G.dir * 5 * U, Jg.h1[1] + 2 * U, Jg.h1[0] + G.dir * 7 * U, Jg.h1[1] - 3 * U, 4);
+  if (S.glitch) {
+    ctx.save(); ctx.translate(-4 + rr(-2, 2), 0); drawFig(Js, '#ff2b2b', .6, true); ctx.translate(8, 0); drawFig(Js, '#00e5ff', .6, true); ctx.restore();
+    if (rnd() > .12) { ctx.save(); ctx.translate(rr(-2, 2), 0); drawFig(Js, SC, 1); ctx.restore(); }
+  } else drawFig(Js, SC, 1);
+  if (S.ghost || sandA > .1) { ctx.strokeStyle = TEAL; ctx.lineWidth = Js.lw * .45; ctx.globalAlpha = .9; ctx.beginPath(); ctx.moveTo(Js.hip[0], Js.hip[1]); ctx.lineTo(Js.nk[0], Js.nk[1]); ctx.stroke(); ctx.globalAlpha = 1; }
+  ctx.strokeStyle = '#fff3a0'; ctx.lineWidth = 3; ctx.lineCap = 'round'; ctx.beginPath();
+  for (const b of bullets) { const L = Math.hypot(b.vx, b.vy) || 1, k = b.st === 1 ? .6 * U : 3.5 * U; ctx.moveTo(b.x, b.y); ctx.lineTo(b.x - b.vx / L * k, b.y - b.vy / L * k); }
+  ctx.stroke();
+  if (jav) drawBolt(jav.x - jav.dx * 14 * U, jav.y - jav.dy * 14 * U, jav.x, jav.y, 5);
+  drawFx();
+}
+let last = 0;
+function loop(ts) {
+  const dt = min(.05, (ts - last) / 1000 || 0); last = ts;
+  if (dt > 0) frame(dt * SPEED); render(); requestAnimationFrame(loop);
+}
+window.addEventListener('resize', resize);
+resize(); requestAnimationFrame(loop);
+
+// debug: run every pattern headlessly and report script errors
+window.selftest = function (secs = 60) {
+  const rep = {}, keep = FORCE;
+  for (const k of Object.keys(SEQ)) {
+    FORCE = k; lastErr = null; resetAll(); let bad = 0;
+    for (let i = 0; i < secs * 60; i++) { frame(1 / 60); if (lastErr) break; if (!isFinite(G.x + S.x + G.y + S.y)) { bad = 1; break; } }
+    rep[k] = lastErr || (bad ? 'NaN' : 'ok');
+  }
+  FORCE = keep; lastErr = null; resetAll(); return rep;
+};
+</script>
+</body>
+</html>
